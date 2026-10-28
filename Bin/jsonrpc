@@ -1,0 +1,25 @@
+#! /bin/bash
+
+[[ "$1" = "undefined" ]] && exit
+
+jsonrpc=$(cat /config/prefs/PlayDVD/jsonrpc) 2> /dev/null
+[[ -z "$jsonrpc" ]] && exit
+
+[[ "$1" = "-q" ]] && output="/dev/null" && shift || output="-"
+
+mac=${1,,}
+[[ "${mac}" =~ ^([0-9a-f]{2}:){5}([0-9a-f]{2})$ ]] && shift || mac=""
+
+[[ $# -gt 0 ]] || exit
+	
+params="\"${mac}\",["
+while true
+do
+	params+='"'"$1"'"'
+	shift
+	[[ $# -eq 0 ]] && break || params+=","
+done
+params+="]"
+
+req='{"id":1,"method":"slim.request","params":['"${params}"']}'
+curl -sX POST "${jsonrpc}" -d "${req}" -o "${output}" 2> /dev/null

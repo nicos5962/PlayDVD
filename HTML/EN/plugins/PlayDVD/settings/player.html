@@ -1,0 +1,383 @@
+[% PROCESS settings/header.html %]
+
+<style>
+  #rc_details {
+    max-width: 640px;
+    border: 1px solid #888;
+    background-color: #f7f7f7;
+    padding: 8px 10px;
+    font-family: monospace;
+    white-space: pre-wrap;
+    min-height: 3em;
+  }
+  #rc-status-light {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 6px;
+    background-color: gray;
+    vertical-align: middle;
+  }
+  #rc-status-light[data-state="ok"]   { background-color: limegreen; }
+  #rc-status-light[data-state="wait"] { background-color: orange; }
+  #rc-status-light[data-state="err"]  { background-color: red; }
+  .nav-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .nav-row label { font-weight: bold; }
+  .nav-row select { max-width: 100%; }
+  .rc-hint { color: #666; font-size: 90%; }
+</style>
+
+[% WRAPPER setting title="PLUGIN_PLAYDVD_LOG" %]
+	<div class="prefDesc">
+    <a href="/plugins/PlayDVD/[% playerid %]/transcode.log" target="log">/logs/PlayDVD/[% playerid %]/transcode.log</a>
+    (<a href="/plugins/PlayDVD/[% playerid %]/transcode.log?lines=100" target="log">100</a>,
+    <a href="/plugins/PlayDVD/[% playerid %]/transcode.log?lines=500" target="log">500</a>,
+    <a href="/plugins/PlayDVD/[% playerid %]/transcode.log?lines=1000" target="log">1000</a>
+    [% "LINES" | string %],/
+    <a href="/plugins/PlayDVD/[% playerid %]/transcode.log?full=1">[% "EVERYTHING" | string | lower %]</a>,
+    <a href="/plugins/PlayDVD/[% playerid %]/transcode.log?zip=1">[% "SETUP_LOG_ZIPPED" | string %]</a>)
+	</div>
+[% END %]
+
+[% WRAPPER setting title="Remote Control" %]
+<div id="rc_remote">
+  <span id="rc-status-light" data-state="off"></span>
+  <span id="rc-status-info" role="status" aria-live="polite">-</span>
+</div>
+[% END %]
+
+[% WRAPPER setting title="DVD" %]
+<div class="nav-row">
+  <label>Source:</label>
+  <span id="rc_source">-</span>
+  <label>Duration:</label>
+  <span id="rc_duration">-</span>
+</div>
+<div class="nav-row">
+  <label for="rc_chapterSelect">Chapter:</label>
+  <select id="rc_chapterSelect" style="min-width: 260px;"></select>
+  <span id="rc_chapterHint" class="rc-hint"></span>
+</div>
+[% END %]
+
+[% WRAPPER setting title="Audio Streams" %]
+<div class="nav-row">
+  <label for="rc_streamSelect">Audio:</label>
+  <select id="rc_streamSelect" style="min-width: 320px;" disabled></select>
+  <span id="rc_streamHint" class="rc-hint"></span>
+</div>
+[% END %]
+
+[% WRAPPER setting title="Details" %]
+<div id="rc_details"></div>
+[% END %]
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Config — adapt the paths to how the handlers are registered in the plugin
+  // ---------------------------------------------------------------------------
+  const PLAYER = "[% playerid | html %]";
+  const API = {
+    state:   '/plugins/PlayDVD/ffmpeg/init',            // GET   player, cmd=init            -> state JSON
+    audio:   '/plugins/PlayDVD/ffmpeg/astreamselect',   // POST  player, cmd=astreamselect, map=<n>
+    chapter: null,                                      // POST  player, cmd=set-chapter, value=<n>  (null = not available yet)
+  };
+  const T = {
+    poll: 1500,        // ms between polls while a DVD is active
+    idle: 5000,        // ... when nothing is playing
+    error: 10000,      // ... after a failed request
+    hidden: 15000,     // ... when the tab is not visible
+    fetch: 4000,       // request timeout
+    pending: 6000,     // max wait for ffmpeg to confirm a switch
+    errorShown: 6000,  // how long an error stays in the status line
+  };
+
+  // ---------------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    light: $('rc-status-light'), info: $('rc-status-info'),
+    source: $('rc_source'), duration: $('rc_duration'),
+    chapter: $('rc_chapterSelect'), chapterHint: $('rc_chapterHint'),
+    audio: $('rc_streamSelect'), audioHint: $('rc_streamHint'),
+    details: $('rc_details'),
+  };
+
+  const view = {
+    state: null,      // last good state from the backend (null = nothing playing)
+    offline: false,   // last request failed
+    pending: null,    // { value, run, since }  audio switch waiting for ffmpeg's confirmation
+    error: null,      // { text, until }
+    elapsed: null,    // seconds, from LMS (used to show the current chapter)
+    timer: null, busy: false, again: false,
+  };
+
+  // ---------------------------------------------------------------------------
+  // Network
+  // ---------------------------------------------------------------------------
+  async function api(url, { method = 'GET', params = {} } = {}) {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), T.fetch);
+    try {
+      const qs = new URLSearchParams({ player: PLAYER, ...params });
+      const opts = { method, cache: 'no-store', signal: ctrl.signal };
+      let target = url;
+      if (method === 'GET') {
+        target += (url.includes('?') ? '&' : '?') + qs;
+      } else {
+        opts.headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+        opts.body = qs.toString();
+      }
+      const res = await fetch(target, opts);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  // elapsed seconds of the player, straight from LMS (no backend change needed)
+  async function fetchElapsed() {
+    const res = await fetch('/jsonrpc.js', {
+      method: 'POST',
+      cache: 'no-store',
+      body: JSON.stringify({ id: 1, method: 'slim.request', params: [PLAYER, ['status', '-', 1]] }),
+    });
+    const json = await res.json();
+    const t = json && json.result ? Number(json.result.time) : NaN;
+    return Number.isFinite(t) ? t : null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Formatting
+  // ---------------------------------------------------------------------------
+  function langName(code) {
+    if (!code) return '';
+    try {
+      return new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' }).of(code) || code;
+    } catch (e) {
+      return code;
+    }
+  }
+
+  // "ac3, 48000 Hz, 5.1(side), fltp, 448 kb/s"  ->  "AC3 5.1, 48 kHz, 448 kb/s"
+  function formatAudio(a, i) {
+    const parts = String(a.properties || '').split(',').map((p) => p.trim());
+ //   const codec = parts[0] ? parts[0].toUpperCase() : '';
+    const codec = parts[0] ? parts[0] : '';
+    const rate = parts.find((p) => /\bHz$/.test(p));
+    const layout = parts[2] ? parts[2].replace(/\(.*\)/, '') : '';
+    const bitrate = parts.find((p) => /kb\/s$/.test(p));
+    const tech = [
+      [codec, layout].filter(Boolean).join(' '),
+      rate ? `${Math.round(parseInt(rate, 10) / 1000 * 10) / 10} kHz` : '',
+      bitrate || '',
+    ].filter(Boolean).join(', ');
+    const name = langName(a.language) || `Audio ${i + 1}`;
+    return tech ? `${i + 1}. ${name} \u2014 ${tech}` : `${i + 1}. ${name}`;
+  }
+
+  function formatTime(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    const mm = String(m).padStart(2, '0'), ss = String(s).padStart(2, '0');
+    return h ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+  }
+
+  function currentChapter(chapters, elapsed) {
+    if (!chapters.length || elapsed == null) return null;
+    let idx = 0;
+    chapters.forEach((c, i) => { if (c.start <= elapsed) idx = i; });
+    return idx;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rendering (idempotent: render() can be called any time)
+  // ---------------------------------------------------------------------------
+  function setStatus(state, text) {
+    els.light.dataset.state = state;
+    els.info.textContent = text;
+  }
+
+  // Rebuild the options only if the list changed, so an open dropdown is left alone
+  function fillSelect(select, items) {
+    const sig = JSON.stringify(items);
+    if (select.dataset.sig === sig) return;
+    select.dataset.sig = sig;
+    select.textContent = '';
+    items.forEach((it) => {
+      const o = document.createElement('option');
+      o.value = String(it.value);
+      o.textContent = it.label;
+      select.appendChild(o);
+    });
+  }
+
+  function setValue(select, value) {
+    if (value == null || document.activeElement === select) return;
+    if (select.value !== String(value)) select.value = String(value);
+  }
+
+  function setError(text) {
+    view.error = { text, until: Date.now() + T.errorShown };
+  }
+
+  function render() {
+    const s = view.state;
+    const hasError = view.error && Date.now() < view.error.until;
+
+    if (!s || !s.from) {                              // nothing playing
+      fillSelect(els.audio, []);
+      fillSelect(els.chapter, []);
+      els.audio.disabled = els.chapter.disabled = true;
+      els.source.textContent = els.duration.textContent = '-';
+      els.source.removeAttribute('title');
+      els.audioHint.textContent = els.chapterHint.textContent = '';
+      els.details.textContent = '';
+      if (view.offline)    setStatus('err', 'Cannot reach the server.');
+      else if (hasError)   setStatus('err', view.error.text);
+      else                 setStatus('off', 'No DVD playing.');
+      return;
+    }
+
+    const audio = Array.isArray(s.audio) ? s.audio : [];
+    const chapters = Array.isArray(s.chapters) ? s.chapters : [];
+
+    els.source.textContent = String(s.from).split('/').pop();
+    els.source.title = s.from;
+    els.duration.textContent = s.duration || '-';
+
+    // audio
+    fillSelect(els.audio, audio.map((a, i) => ({ value: i, label: formatAudio(a, i) })));
+    const switchable = !!s.ready && !!s.switchable && audio.length > 1;
+    els.audio.disabled = !switchable || !!view.pending;
+    setValue(els.audio, view.pending ? view.pending.value : s.current);
+    els.audioHint.textContent =
+      !s.ready ? 'Starting\u2026'
+      : view.pending ? 'Switching\u2026'
+      : audio.length < 2 ? 'Only one audio stream.'
+      : !s.switchable ? 'Switching is not available for this stream.'
+      : '';
+
+    // chapters
+    fillSelect(els.chapter, chapters.map((c, i) => ({ value: i, label: `${i + 1}. ${formatTime(c.start)}` })));
+    els.chapter.disabled = !s.ready || !chapters.length;       // was: !API.chapter || ...
+    view.chapterIdx = currentChapter(chapters, view.elapsed);
+    setValue(els.chapter, view.chapterIdx);
+    els.chapterHint.textContent = (!API.chapter && chapters.length) ? 'View only.' : '';
+    // details
+    const active = audio[s.current];
+    els.details.textContent = [
+      `Format:   ${s.format || '-'}`,
+      `Audio:    ${active ? active.properties : '-'}`,
+      `Run:      #${s.run}`,
+    ].join('\n');
+
+    // status line
+    if (view.offline)       setStatus('err', 'Cannot reach the server.');
+    else if (hasError)      setStatus('err', view.error.text);
+    else if (!s.ready)      setStatus('wait', 'Starting\u2026');
+    else if (view.pending)  setStatus('wait', 'Switching audio stream\u2026');
+    else                    setStatus('ok', `Connected \u2014 ${audio.length} audio stream${audio.length === 1 ? '' : 's'}.`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pending audio switch: keep what the user picked until ffmpeg confirms it
+  // ---------------------------------------------------------------------------
+  function reconcilePending() {
+    const p = view.pending, s = view.state;
+    if (!p) return;
+    if (!s || s.run !== p.run || s.current === p.value) { view.pending = null; return; }
+    if (Date.now() - p.since > T.pending) {
+      view.pending = null;
+      setError('ffmpeg did not confirm the audio switch.');
+    }
+  }
+
+  async function onAudioChange() {
+    if (view.pending || !view.state) return;
+    const value = Number(els.audio.value);
+    view.pending = { value, run: view.state.run, since: Date.now() };
+    render();
+    try {
+      const res = await api(API.audio, { method: 'POST', params: { cmd: 'astreamselect', map: value } });
+      if (!res || res.ok !== true) throw new Error((res && (res.message || res.error)) || 'switch refused');
+    } catch (e) {
+      view.pending = null;
+      setError(`Audio switch failed: ${e.message}`);
+      render();
+      return;
+    }
+    loop();                    // read ffmpeg's confirmation right away
+  }
+
+  async function onChapterChange() {
+    if (!API.chapter) {
+      // Display only: the list can be opened and scrolled, but a pick is undone.
+      els.chapter.value = String(view.chapterIdx ?? 0);
+      els.chapter.blur();      // polling skips a focused <select>; release it so it follows playback again
+      return;
+    }
+    try {
+      await api(API.chapter, { method: 'POST', params: { cmd: 'set-chapter', value: Number(els.chapter.value) } });
+    } catch (e) {
+      setError(`Chapter change failed: ${e.message}`);
+    }
+    loop();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Polling loop: one request chain, timeouts, back-off, pause when hidden
+  // ---------------------------------------------------------------------------
+  async function refresh() {
+    const wantElapsed = view.state && Array.isArray(view.state.chapters) && view.state.chapters.length;
+    const [state, elapsed] = await Promise.all([
+      api(API.state, { params: { cmd: 'init' } }),
+      wantElapsed ? fetchElapsed().catch(() => null) : null,
+    ]);
+    view.offline = false;
+    view.state = state && !state.error ? state : null;
+    view.elapsed = elapsed;
+    reconcilePending();
+    render();
+  }
+
+  async function loop() {
+    if (view.busy) { view.again = true; return; }     // never two requests chains at once
+    view.busy = true;
+    clearTimeout(view.timer);
+    let next = T.poll;
+    try {
+      await refresh();
+      if (!view.state || !view.state.from) next = T.idle;   // nothing playing: poll slowly
+    } catch (e) {
+      view.offline = true;
+      render();
+      next = T.error;
+    }
+    view.busy = false;
+    const wait = view.again ? 0 : (document.hidden ? T.hidden : next);
+    view.again = false;
+    view.timer = setTimeout(loop, wait);
+  }
+
+  els.audio.addEventListener('change', onAudioChange);
+  els.chapter.addEventListener('change', onChapterChange);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) loop(); });
+
+  loop();
+})();
+</script>
+
+[% PROCESS settings/footer.html %]

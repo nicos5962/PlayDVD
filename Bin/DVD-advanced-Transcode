@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# DVD-advanced-Transcode — V1
+# Lyrion plugin helper: extracts audio from a DVD ISO/device via ffmpeg
+# and streams it to stdout for LMS to consume.
+#
+# Based on DVD-Transcode V2 (robust base), plus live audio-track switching:
+#   - all audio streams of the title are probed (stream_info)
+#   - when there is more than one, they are fed to astreamselect, followed by
+#     azmq so the plugin can change the active track while playing
+#     (ZMQ endpoint read from the player pref plugin.playdvd:zmq_port)
+#   - with a single audio stream, no filter graph / ZMQ is used
+#
+# Usage:
+#   DVD-advanced-Transcode -m <MAC> -f <audio_format> "<dvd_uri>"
+#
+# Example:
+#   DVD-advanced-Transcode -m aa:bb:cc:dd:ee:ff -f flac \
+#     "dvd:///music/dvdrips/Annihilator/ANNIHILATOR_LIVE.iso?title=4"
+# ==============================================================================
+
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------------------------
+SCRIPT_NAME="$(basename "$0")"
+VERSION="2.0.0"
+BASEDIR="${PLAYDVD_BASEDIR:-/config/prefs/PlayDVD}"   # env override: handy for testing
+JSONRPC="${PLAYDVD_JSONRPC:-/config/cache/Plugins/PlayDVD/Bin/jsonrpc}"
+FFREPORT_LEVEL=40                                     # 32 = info, 40 = verbose (shows filter graph)
+
+ASTREAM_SELECT_IN_LABEL=""   # e.g. [0:a:0][0:a:1][0:a:2]
+ASTREAM_SELECT_INPUT=0       # number of audio streams found
+ASTREAM_SELECT_MAP=0         # audio stream active at start
+ZMQ_PORT=""
+
+# ------------------------------------------------------------------------------
+# Logging helper — all script logs go to a per-run log file, never stdout
+# (stdout is reserved for the audio stream piped to LMS)
+# ------------------------------------------------------------------------------
+log() {
+    echo "$*" >> "${LOG}"
+}
+
+# Fatal error: message goes to stderr, which is captured in LOGTMP and merged
+# into the log by clean_exit.
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+# Cleanup — runs on every exit path once the trap is installed
+# ------------------------------------------------------------------------------
+clean_exit() {
+    local rc=$?
+    trap - EXIT
+
+    if (( rc != 0 )) && [[ -s "${FFMPEG_LOG}" ]]; then
+        if grep -qE 'Broken pipe|received signal' "${FFMPEG_LOG}"; then
+            log "  Stream interrupted by client"
+            rc=0        # skip/stop is normal: report success
+        else
+            { echo "  --- ffmpeg report (last 20 lines) ---"; tail -n 20 "${FFMPEG_LOG}"; } \
+                | sed 's/^/  /' >> "${LOG}"
+        fi
+    fi
+
+    sed -e '/Broken pipe/d' -e 's/^/  /' "${LOGTMP}" >> "${LOG}" || true
+    log "  Exit status: ${rc}"
+    cat "${LOG}" >> "${LOGMAIN}"
+    rm -f "${LOGTMP}" "${LOG}" "${FFMPEG_LOG}"
+    exit "${rc}"
+}
+
+# ------------------------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------------------------
+usage() {
+    cat >&2 <<EOF
+Usage: ${SCRIPT_NAME} -m <player_mac> -f <audio_format> "<dvd_uri>"
+
+  -m <MAC>          MAC address of the Lyrion player (used for log filenames)
+  -f <format>       Audio output format passed to ffmpeg  (e.g. flac, mp3, s16le)
+  <dvd_uri>         DVD URI ending with ?title=<N>
+                    (e.g. dvd:///path/to/disc.iso?title=4)
+
+EOF
+    exit 1
+}
+
+if [[ "${1:-}" == "--version" ]]; then
+    echo "${SCRIPT_NAME} v${VERSION}"
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# stream_info <dvd_path> <title>
+# Lists the audio streams of the title (ffmpeg prints the input streams as
+# "Stream #0:1[0x80]...: Audio: ..."; the output stream line has no [0x..], so
+# it is ignored) and fills:
+#   ASTREAM_SELECT_INPUT     number of audio streams
+#   ASTREAM_SELECT_IN_LABEL  filtergraph input labels: [0:a:0][0:a:1]...
+# ------------------------------------------------------------------------------
+stream_info() {
+    local audio_stream stream_index=0
+    ASTREAM_SELECT_INPUT=0
+    ASTREAM_SELECT_IN_LABEL=""
+    while read -r audio_stream; do
+        if [[ ${audio_stream} =~ Stream\ #([0-9]+):[0-9]+\[.*Audio ]]; then
+            ASTREAM_SELECT_IN_LABEL+="[${BASH_REMATCH[1]}:a:${stream_index}]"
+            ((++stream_index))
+            ((++ASTREAM_SELECT_INPUT))
+        fi
+    done < <(ffmpeg -hide_banner -nostats -nostdin -t 10 -vn -f dvdvideo -title "$2" -i "$1" \
+                    -f s24le - 2>&1 >/dev/null < /dev/null | grep 'Stream #')
+}
+
+# ------------------------------------------------------------------------------
+# Parse arguments
+# ------------------------------------------------------------------------------
+PLAYER_MAC=""
+OUTFORMAT=""
+ARGS="$*"
+
+while getopts ":m:f:" opt; do
+    case "${opt}" in
+        m) PLAYER_MAC="${OPTARG}" ;;
+        f) OUTFORMAT="${OPTARG}" ;;
+        :)
+            echo "Option -${OPTARG} requires an argument." >&2
+            usage
+            ;;
+        \?)
+            echo "Unknown option -${OPTARG}." >&2
+            usage
+            ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+
+DVD_URI="${1:-}"
+
+# ------------------------------------------------------------------------------
+# Validate required arguments
+# ------------------------------------------------------------------------------
+[[ -z "${PLAYER_MAC}" ]] && { echo "-m <player_mac> is required."  >&2; usage; }
+[[ -z "${OUTFORMAT}" ]]  && { echo "-f <audio_format> is required." >&2; usage; }
+[[ -z "${DVD_URI}" ]]    && { echo "DVD URI argument is required."  >&2; usage; }
+
+[[ "${PLAYER_MAC}" =~ ^[0-9A-Fa-f:-]+$ ]] || { echo "Invalid player MAC." >&2; usage; }
+[[ "${OUTFORMAT}" =~ ^[A-Za-z0-9_]+$ ]]   || { echo "Invalid audio format." >&2; usage; }
+
+FILE_ID="${PLAYER_MAC//:/-}"       # dash form: safe in filenames and in FFREPORT
+CLIENTID="${FILE_ID//-/:}"         # colon form: used for the LMS jsonrpc call
+
+# ------------------------------------------------------------------------------
+# Set up log directory and files, then install the trap and capture stderr
+# ------------------------------------------------------------------------------
+LOGDIR="${BASEDIR}/remote_players/${FILE_ID}"
+mkdir -p "${LOGDIR}"
+LOGMAIN="${LOGDIR}/transcode.log"
+touch "${LOGMAIN}"
+LOG=$(mktemp --tmpdir="${LOGDIR}" --suffix=".log" transcode-XXXXXX)
+LOGTMP=$(mktemp --tmpdir="${LOGDIR}" --suffix=".tmp" stderr-XXXXXX)
+FFMPEG_LOG="${LOGDIR}/ffmpeg-report.log"
+: > "${FFMPEG_LOG}"      # start from an empty report (no stale content from a killed run)
+
+exec 2>> "${LOGTMP}"     # from here on, every error message ends up in the log
+trap clean_exit EXIT     # from here on, every exit path is cleaned up
+
+log "[${SCRIPT_NAME} v${VERSION}] ${ARGS}"
+log "  Clock: $(date +%H:%M:%S.%3N)"
+
+# ------------------------------------------------------------------------------
+# Parse DVD URI
+# Supported format:
+#   dvd:///path/to/file.iso?title=4
+#   dvd:///path/to/file.iso?title=4&chapter=2   (chapter ignored in V2)
+# ------------------------------------------------------------------------------
+DVD_PATH=""
+DVD_TITLE=""
+DVD_CHAPTER=1   # parsed but not used yet
+
+# Strip the dvd:// prefix, then split on '?'
+uri_no_scheme="${DVD_URI#dvd://}"          # /path/to/file.iso?title=4
+uri_path="${uri_no_scheme%%\?*}"           # /path/to/file.iso
+uri_query="${uri_no_scheme#*\?}"           # title=4  (or title=4&chapter=2)
+
+# URL-decode the path (convert %XX sequences to characters).
+# Literal backslashes are protected first so printf %b does not interpret them.
+uri_path="${uri_path//\\/%5C}"
+DVD_PATH="$(printf '%b' "${uri_path//%/\\x}")"
+
+# Extract ?title= (mandatory, numeric)
+if [[ "${uri_query}" =~ (^|[&])title=([^&]+) ]]; then
+    DVD_TITLE="${BASH_REMATCH[2]}"
+else
+    die "DVD URI must contain '?title=<N>' (query: ${uri_query})"
+fi
+[[ "${DVD_TITLE}" =~ ^[0-9]+$ ]] || die "Invalid title: ${DVD_TITLE}"
+
+# Extract ?chapter= (optional, numeric)
+if [[ "${uri_query}" =~ (^|[&])chapter=([^&]+) ]]; then
+    DVD_CHAPTER="${BASH_REMATCH[2]}"
+    [[ "${DVD_CHAPTER}" =~ ^[0-9]+$ ]] || die "Invalid chapter: ${DVD_CHAPTER}"
+fi
+
+# If the path ends with a .VOB file, remove the filename
+if [[ "${DVD_PATH}" =~ /VIDEO_TS/[^/]+\.VOB$ ]]; then
+    DVD_PATH="${DVD_PATH%/*}"
+fi
+
+log "  Source: ${DVD_PATH/*music/Music Folder}"
+log "  Title: ${DVD_TITLE}"
+log "  Output format: ${OUTFORMAT^^}"
+
+# ------------------------------------------------------------------------------
+# Pre-flight checks
+# ------------------------------------------------------------------------------
+command -v ffmpeg &>/dev/null || die "ffmpeg not found in PATH."
+command -v jq     &>/dev/null || die "jq not found in PATH."
+[[ -e "${DVD_PATH}" ]]        || die "Source not found: ${DVD_PATH}"
+
+# ------------------------------------------------------------------------------
+# Probe the audio streams of the title
+# ------------------------------------------------------------------------------
+stream_info "${DVD_PATH}" "${DVD_TITLE}"
+(( ASTREAM_SELECT_INPUT > 0 )) || die "No audio stream found in title ${DVD_TITLE}"
+log "  Audio streams: ${ASTREAM_SELECT_INPUT}"
+
+# ------------------------------------------------------------------------------
+# Build and run the ffmpeg command
+#
+# -nostdin          : never read the (inherited) stdin
+# -v 0              : suppress console output (details go to the FFREPORT file)
+# -f dvdvideo       : DVD demuxer
+# -title            : DVD title number
+# -readrate 1       : read at 1x speed to simulate real-time playback
+# -nostats          : no progress lines in the report
+# -i                : input (ISO path / VIDEO_TS folder)
+# -filter_complex   : astreamselect (track switch) + azmq (ZMQ command input)
+# -map '[out]'      : the filter graph output
+# -vn               : drop video stream
+# -f <format>       : output audio format
+# -                 : write to stdout → piped to LMS
+#
+# ffmpeg runs as a background job so the shell can forward SIGTERM/INT/HUP to
+# it. This also frees the ZMQ port immediately when LMS stops the stream.
+# ------------------------------------------------------------------------------
+FFMPEG_CMD=( ffmpeg -nostdin -v 0
+             -f dvdvideo -title "${DVD_TITLE}" -readrate 1 -nostats -i "${DVD_PATH}" )
+
+if (( ASTREAM_SELECT_INPUT == 1 )); then
+    # Single audio stream: plain extraction, no filter graph, no ZMQ
+    FFMPEG_CMD+=( -vn -f "${OUTFORMAT}" - )
+else
+    ZMQ_PORT=$("${JSONRPC}" "${CLIENTID}" playerpref plugin.playdvd:zmq_port '?' \
+               | jq -r '.result._p2 // empty') || true
+    [[ -n "${ZMQ_PORT}" ]] || die "No plugin.playdvd:zmq_port pref for player ${CLIENTID}"
+    [[ "${ZMQ_PORT}" =~ ^[A-Za-z0-9:/.*_-]+$ ]] || die "Invalid zmq_port value: ${ZMQ_PORT}"
+    log "  ZMQ endpoint: ${ZMQ_PORT}"
+
+    # ':' must be escaped twice in a filtergraph (option level + graph level):
+    # tcp://127.0.0.1:5555  ->  tcp\\://127.0.0.1\\:5555
+    ZMQ_ENDPOINT="${ZMQ_PORT//:/\\\\:}"
+
+    FFMPEG_FILTERS="${ASTREAM_SELECT_IN_LABEL}astreamselect=inputs=${ASTREAM_SELECT_INPUT}:map=${ASTREAM_SELECT_MAP}[map]"
+    FFMPEG_FILTERS+=";[map]azmq=bind_address=${ZMQ_ENDPOINT}[out]"
+
+    FFMPEG_CMD+=( -filter_complex "${FFMPEG_FILTERS}" -map "[out]" -vn -f "${OUTFORMAT}" - )
+fi
+
+log "  Command: $(printf '%q ' "${FFMPEG_CMD[@]}")"
+
+FFREPORT="file=${FFMPEG_LOG}:level=${FFREPORT_LEVEL}" "${FFMPEG_CMD[@]}" &
+FFPID=$!
+trap 'kill -TERM "${FFPID}" 2>/dev/null' TERM INT HUP
+
+# A trapped signal interrupts `wait`, so loop until ffmpeg is really gone.
+rc=0
+while kill -0 "${FFPID}" 2>/dev/null; do
+    wait "${FFPID}" && rc=0 || rc=$?
+done
+
+exit "${rc}"     # → clean_exit logs the status, merges logs, removes temp files

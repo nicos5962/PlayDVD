@@ -1,0 +1,56 @@
+[% PROCESS settings/header.html %]
+
+[% MACRO status_light(installed) BLOCK %]
+  [% SET color = 'red' %]
+  [% IF installed == 'yes' %]
+    [% SET color = 'green' %]
+  [% END %]
+  <div style="display: inline-block; width: 16px; height: 16px; background-color: [% color %];"></div>
+[% END %]
+
+[% WRAPPER setting title="Play DVD plugin" %]
+<img src="[% icon | resizeimage(165, 73) %]" border="0" alt="[% "PlayDVD plugin" | html %]">
+[% END %]
+
+[% WRAPPER setting title="DVD binaries" %]
+    <div>
+      <fieldset>
+        <legend>Choose binary</legend>
+        <select name="binary_choice">
+          [% FOREACH bin IN binaries %]
+            <option value="[% bin.name %]" [% IF prefered_binary == bin.name %]selected[% END %]>[% bin.version%]</option>   
+          [% END %]
+        </select>
+      </fieldset>
+    </div>
+  </div>
+[% END %]
+
+[% WRAPPER setting title="System requirements" %]
+  [% WRAPPER settingSection %]
+    [% status_light(ffmpeg_installed) %] FFmpeg
+  [% END %]
+  [% WRAPPER settingSection %]
+    [% status_light(has_ffmpeg_zmq) %] FFmpeg+ZMQ 
+  [% END %]
+  [% WRAPPER settingSection %]
+    [% status_light(has_zmqsend) %] [% zmqsend_path %] 
+  [% END %]  
+[% END %]
+
+[% WRAPPER setting title="zmq port assignments" %]
+<table>
+  [% FOREACH d IN devices %]
+  <tr>
+    <td>[% d.name %]</td>
+    <td>[% d.mac %]</td>
+    <td>
+      <input type="text" value="[% d.port %]" readonly
+             style="border: 1px solid #ccc; padding: 2px 6px; width: 160px; text-align: center; background-color: #f9f9f9;">
+    </td>
+  </tr>
+  [% END %]
+</table>
+[% END %]
+
+[% PROCESS settings/footer.html %]

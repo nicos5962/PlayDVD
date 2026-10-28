@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+
+<extension>
+	<name>PLUGIN_PLAYDVD</name>
+	<module>Plugins::PlayDVD::Plugin</module>
+	<version>1.5.2</version>
+	<description>PLUGIN_PLAYDVD_DESC</description>
+	<creator>nicos</creator>
+	<defaultState>enabled</defaultState>
+	<importmodule>Plugins::PlayDVD::Importer</importmodule>	
+	<icon>plugins/PlayDVD/html/images/icon.svg</icon>
+  <optionsURL>plugins/PlayDVD/settings/basic.html</optionsURL>  
+	<type>2</type><!-- type=extension -->
+	<targetApplication>
+		<id>SlimServer</id>
+		<minVersion>7.7</minVersion>
+        <maxVersion>*</maxVersion>
+	</targetApplication>
+</extension>
