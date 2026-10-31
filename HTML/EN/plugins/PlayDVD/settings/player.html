@@ -372,8 +372,16 @@
     view.timer = setTimeout(loop, wait);
   }
 
-  els.audio.addEventListener('change', onAudioChange);
-  els.chapter.addEventListener('change', onChapterChange);
+  // These dropdowns are player controls, not settings. LMS flags the page as modified
+  // (and asks to save when leaving it) on any change or blur of an input/textarea/select.
+  // A capture listener on the element itself runs before LMS' listeners: stop the event
+  // there so LMS never sees it, and run our own handler from it.
+  function bindControl(el, handler) {
+    el.addEventListener('change', ev => { ev.stopImmediatePropagation(); handler(ev); }, true);
+    el.addEventListener('blur', ev => ev.stopImmediatePropagation(), true);
+  }
+  bindControl(els.audio, onAudioChange);
+  bindControl(els.chapter, onChapterChange);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) loop(); });
 
   loop();

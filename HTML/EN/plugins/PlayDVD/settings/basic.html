@@ -27,15 +27,38 @@
 [% END %]
 
 [% WRAPPER setting title="System requirements" %]
-  [% WRAPPER settingSection %]
-    [% status_light(ffmpeg_installed) %] FFmpeg
-  [% END %]
-  [% WRAPPER settingSection %]
-    [% status_light(has_ffmpeg_zmq) %] FFmpeg+ZMQ 
-  [% END %]
-  [% WRAPPER settingSection %]
-    [% status_light(has_zmqsend) %] [% zmqsend_path %] 
-  [% END %]  
+<table cellpadding="4" cellspacing="0" style="border-collapse: collapse;">
+  <tr style="text-align: left; border-bottom: 1px solid #ccc;">
+    <th>Component</th>
+    <th>Status</th>
+    <th>Details</th>
+  </tr>
+  <tr>
+    <td>FFmpeg</td>
+    <td>[% status_light(ffmpeg_installed) %]</td>
+    <td>Audio extraction and transcoding</td>
+  </tr>
+  <tr>
+    <td>FFmpeg + ZMQ</td>
+    <td>[% status_light(has_ffmpeg_zmq) %]</td>
+    <td>azmq filter, required to switch audio streams while playing</td>
+  </tr>
+  <tr>
+    <td>zmqsend</td>
+    <td>[% status_light(has_zmqsend) %]</td>
+    <td>[% zmqsend_path %]</td>
+  </tr>
+  <tr>
+    <td>mplayer</td>
+    <td>[% status_light(has_mplayer) %]</td>
+    <td>Title discovery while scanning DVDs</td>
+  </tr>
+  <tr>
+    <td>lsdvd</td>
+    <td>[% status_light(has_lsdvd) %]</td>
+    <td>Audio streams shown in track info</td>
+  </tr>
+</table>
 [% END %]
 
 [% WRAPPER setting title="zmq port assignments" %]

@@ -34,10 +34,10 @@ sub pathFromFileURL {
 
 sub fileURLFromPath {
 	my $path 	= shift;
-	
-	my $url 	= Slim::Utils::Misc::fileURLFromPath($path);	
-	$url 		=~ s/^file:/dvd:/;	
-	return $url;	
+
+	my $url 	= Slim::Utils::Misc::fileURLFromPath($path);
+	$url 		=~ s/^file:/dvd:/;
+	return $url;
 }
 
 sub isDVD {
@@ -59,9 +59,9 @@ sub isDVD {
 sub isDVDURL {
     my ($class, $url) = @_;
     if ($url =~ /^dvd:/) {
-        return 1;    
+        return 1;
     } else {
-        return 0;          
+        return 0;
     }
 }
 
@@ -75,8 +75,8 @@ sub getStreamingFormat {
 }
 
 sub mac {
-    my ($class, $client) = @_;  
-	my $mac 	= lc($client->macaddress);	$mac	=~ s/:/-/g;   
+    my ($class, $client) = @_;
+	my $mac 	= lc($client->macaddress);	$mac	=~ s/:/-/g;
 	return $mac;
 }
 

@@ -33,18 +33,20 @@ sub handler {
 		my @targetfmts 		= ( 'flc', 'mp3', 'pcm', 'wav');
 		my ($prefBinary)	= $params->{'binary_choice'};
 		foreach my $srcfmt (@srcfmts) {
-			foreach my $targetfmt (@targetfmts) {			
+			foreach my $targetfmt (@targetfmts) {
 				my $rule 	= $srcfmt . '-' . $targetfmt . '-*-*';
 				my $transcode 	= $Slim::Player::TranscodingHelper::commandTable{$rule};
 				$transcode 	=~ s/\[.*?\]/\[$prefBinary\]/;
-				$Slim::Player::TranscodingHelper::commandTable{$rule} = $transcode;	
-			}	
-		}	
+				$Slim::Player::TranscodingHelper::commandTable{$rule} = $transcode;
+			}
+		}
 	}
 
 	$params->{icon}							= "plugins/PlayDVD/html/images/icon.png";
 	$params->{'ffmpeg_installed'}		=  check_ffmpeg_installed();
 	$params->{'binaries'}					= check_binaries();
+	$params->{'has_mplayer'}					=  check_command('mplayer');
+	$params->{'has_lsdvd'}					=  check_command('lsdvd');
 	$params->{'has_ffmpeg_zmq'}					=  check_ffmpeg_zmq();
 	($params->{'has_zmqsend'}, $params->{'zmqsend_path'})	=  check_zmqsend();
 	$params->{'prefered_binary'}				= $prefs->get('prefered_binary');
@@ -55,9 +57,9 @@ sub handler {
             mac  => $client->id,
             port => $prefs->client($client)->get('zmq_port'),
         };
-    }  
-    $params->{'devices'} = \@devices;    	
-	
+    }
+    $params->{'devices'} = \@devices;
+
 	return $class->SUPER::handler($client, $params);
 }
 
@@ -82,11 +84,17 @@ sub check_binaries {
 		    name 	=> $bin,
 		    path  	=> $path,
 		    version	=> `$path --version 2>&1`,
-	    };        
-        } 
-	$binaries	= \@available;	
+	    };
+        }
+	$binaries	= \@available;
     }
-    return $binaries; 
+    return $binaries;
+}
+
+sub check_command {
+    my $cmd = shift;
+    return Slim::Utils::Misc::findbin($cmd) || scalar(grep { -x "$_/$cmd" } split /:/, $ENV{PATH} || '')
+        ? "yes" : "no";
 }
 
 sub check_ffmpeg_zmq {
@@ -99,7 +107,7 @@ sub check_ffmpeg_zmq {
 }
 
 sub check_zmqsend {
-	my $path = Slim::Utils::Misc::findbin('zmqsend');	
+	my $path = Slim::Utils::Misc::findbin('zmqsend');
 	if ( !$path ) {
 		$path = qx(find /config/ -type f -name "zmqsend");
 	}

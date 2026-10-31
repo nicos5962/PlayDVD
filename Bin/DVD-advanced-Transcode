@@ -27,7 +27,7 @@ set -euo pipefail
 SCRIPT_NAME="$(basename "$0")"
 VERSION="2.0.0"
 BASEDIR="${PLAYDVD_BASEDIR:-/config/prefs/PlayDVD}"   # env override: handy for testing
-JSONRPC="${PLAYDVD_JSONRPC:-/config/cache/Plugins/PlayDVD/Bin/jsonrpc}"
+JSONRPC="${PLAYDVD_JSONRPC:-$(dirname "$(readlink -f "$0")")/jsonrpc}"
 FFREPORT_LEVEL=40                                     # 32 = info, 40 = verbose (shows filter graph)
 
 ASTREAM_SELECT_IN_LABEL=""   # e.g. [0:a:0][0:a:1][0:a:2]

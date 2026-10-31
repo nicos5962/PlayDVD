@@ -18,6 +18,7 @@ use Scalar::Util qw(blessed);
 use File::Spec::Functions qw(catdir catfile);
 use Slim::Control::Queries;
 use IPC::Open2;
+use IO::Socket::INET;
 use POSIX ();
 use Time::HiRes ();
 use JSON::XS;
@@ -34,15 +35,16 @@ my $log = Slim::Utils::Log->addLogCategory({
 use Slim::Utils::Misc;
 
 my $prefs 	= preferences('plugin.playdvd');
-my $LOG_DIR 	= "/config/prefs/PlayDVD/remote_players/";
 
 # ------------------------------------------------------------------------------
 # GLOBALS (file lexicals). Everything per-player lives in %ffmpegState.
 #
 # ------------------------------------------------------------------------------
 my $BASE_DIR       = catdir(Slim::Utils::OSDetect::dirsFor('prefs'), 'PlayDVD');
+my $LOG_DIR        = catdir($BASE_DIR, 'remote_players');
 my $POLL_INTERVAL  = 1;                        # s between two tails of the report
 my $MAX_INIT_TRIES = 20;                       # x 0.5 s waiting for the report file
+my $MAX_PORT_TRIES = 100;                     # ports tried before giving up on finding a free one
 my $ZMQ_TIMEOUT    = 2;                        # s, hard limit for one zmqsend call
 my $ZMQ_TARGET     = 'Parsed_astreamselect_0'; # filter instance that receives "map"
 
@@ -52,7 +54,7 @@ my $zmqBin;        # cached path of zmqsend
 $prefs->init({
 	'prefered_binary' 	=> "DVD-Transcode",
 	'zmq_next_port'		=> 5555,
-});	
+});
 my $prefBinary		= $prefs->get('prefered_binary');
 
 sub initPlugin {
@@ -60,21 +62,19 @@ sub initPlugin {
 
 	my $version = $class->_pluginDataFor('version') || 'unknown';
 	$log->info("Initializing PlayDVD plugin $version");
-    
+
 	Slim::Player::ProtocolHandlers->registerHandler(
 		dvd => 'Plugins::PlayDVD::ProtocolHandler'
-	); 
+	);
 
-	Slim::Web::Pages->addPageFunction("/transcode.log", \&log_handler);  	
+	Slim::Web::Pages->addPageFunction("/transcode.log", \&log_handler);
 	Slim::Web::Pages->addPageFunction("plugins/PlayDVD/ffmpeg/init", \&ffmpeg_init_handler);
-	Slim::Web::Pages->addPageFunction("plugins/PlayDVD/ffmpeg/astreamselect", \&ffmpeg_astreamselect_handler);		
-	# tell LMS that we need to run the external scanner
-	Slim::Music::Import->addImporter('Plugins::PlayDVD::Importer', { use => 1 });
-	
-	Plugins::PlayDVD::Settings->new($class);  
+	Slim::Web::Pages->addPageFunction("plugins/PlayDVD/ffmpeg/astreamselect", \&ffmpeg_astreamselect_handler);
+
+	Plugins::PlayDVD::Settings->new($class);
 	Plugins::PlayDVD::PlayerSettings->new;
-	_overrideRemoteCheck();	
-	$class->registerFormatHandler();
+	_overrideRemoteCheck();
+	_registerFormatHandler();
 	_init_Prefs();
 	_init_LyrionEvents();
 	$class->SUPER::initPlugin(@_);
@@ -85,13 +85,20 @@ sub pluginDir { shift->_pluginDataFor('basedir') }
 sub shutdownPlugin {
 	my $class = shift;
 	$log->info("Shutting down PlayDVD plugin");
+
+	Slim::Control::Request::unsubscribe(\&initClient);
+	Slim::Control::Request::unsubscribe(\&playlistNewSong);
+	Slim::Control::Request::unsubscribe(\&playlistPause);
+	Slim::Control::Request::unsubscribe(\&playlistStop);
+	Slim::Control::Request::unsubscribe(\&playlistOpen);
+
+	stop_ffmpeg_events($_) for Slim::Player::Client::clients();
 }
 
 sub getDisplayName { 'PLUGIN_PLAYDVD' }
 
 
-sub registerFormatHandler {
-    my ($class, $tagClasses) = @_;
+sub _registerFormatHandler {
     Slim::Formats->init();
     $Slim::Formats::tagClasses{dvd} ||= 'Plugins::PlayDVD::Formats::DVD';
     $Slim::Formats::tagClasses{iso} ||= 'Plugins::PlayDVD::Formats::DVD';
@@ -101,8 +108,8 @@ sub registerFormatHandler {
 
 sub log_handler {
     my ($client, $params, undef, $httpClient, $response) = @_;
-    my $mac	= Plugins::PlayDVD::Utils::Misc->mac($client);	
-    my $logFile = "$LOG_DIR" . "$mac/transcode.log";
+    my $mac	= Plugins::PlayDVD::Utils::Misc->mac($client);
+    my $logFile = catfile($LOG_DIR, $mac, 'transcode.log');
     return Slim::Web::Pages::Common->logFileViewer($client, $params, $httpClient, $response, $logFile);
 }
 
@@ -134,99 +141,134 @@ sub _overrideRemoteCheck {
 	main::INFOLOG && $log->is_info && $log->info('Installed dvd:// remote-track override');
 }
 
-sub	_init_Prefs {
+sub _init_Prefs {
 	foreach my $srcfmt (@srcfmts) {
-		foreach my $targetfmt (@targetfmts) {			
+		foreach my $targetfmt (@targetfmts) {
 			my $rule 	= $srcfmt . '-' . $targetfmt . '-*-*';
 			my $transcode 	= $Slim::Player::TranscodingHelper::commandTable{$rule};
 			$transcode 	=~ s/\[.*?\]/\[$prefBinary\]/;
-			$Slim::Player::TranscodingHelper::commandTable{$rule} = $transcode;	
-			}	
+			$Slim::Player::TranscodingHelper::commandTable{$rule} = $transcode;
+			}
 		}
 ## Store server IP and port in file
-	mkdir('/config/prefs/PlayDVD', 0755) unless (-d '/config/prefs/PlayDVD');
+	mkdir($BASE_DIR, 0755) unless (-d $BASE_DIR);
 	my $serverAddress	= Slim::Utils::Network::serverAddr();
 	my $serverPort		= preferences('server')->get('httpport');
 	my $jsonrpc		= 'http://' . $serverAddress . ':' . $serverPort . '/jsonrpc.js';
-	my $jsonrpcPath 	= "/config/prefs/PlayDVD/jsonrpc";
-	open(my $handle, ">", $jsonrpcPath);
+	my $jsonrpcPath 	= catfile($BASE_DIR, 'jsonrpc');
+	if ( open(my $handle, ">", $jsonrpcPath) ) {
 		print $handle $jsonrpc;
-	close($handle); 				
+		close($handle);
+	}
+	else {
+		$log->error("Cannot write $jsonrpcPath: $!");
+	}
 }
 
 sub initClient {
 	my $request 	= shift;
 	my $client 		= $request->client() || return;
-	$log->info("Initializing client " . $request->client()->macaddress);	
+	$log->info("Initializing client " . $request->client()->macaddress);
 	_init_ClientConfig($client);
+}
+
+# True if nobody listens on 127.0.0.1:$port and no other player has it assigned
+sub _zmq_port_available {
+	my ($client, $port) = @_;
+
+	for my $other ( Slim::Player::Client::clients() ) {
+		next if $other->id eq $client->id;
+		my $assigned = $prefs->client($other)->get('zmq_port') || '';
+		return 0 if $assigned =~ /:\Q$port\E$/;
+	}
+
+	# a successful listen proves the port is free (closed again right away)
+	my $sock = IO::Socket::INET->new(
+		Listen    => 1,
+		LocalAddr => '127.0.0.1',
+		LocalPort => $port,
+		Proto     => 'tcp',
+		ReuseAddr => 1,
+	);
+	return $sock ? 1 : 0;
 }
 
 sub _init_ClientConfig {
 	my ($client) 	= @_;
-	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);	
+	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);
 	# For each client create or update preferences:
 	### 1) FFMPEG		: zmq_host,	zmq_port
 	### 2) VLC HTTP LUA	: lua_http_host, lua_http_port, lua_http_password
-	### 3) MPV IPC		: ipc_server	
+	### 3) MPV IPC		: ipc_server
     my $zmq_port;
 	$zmq_port 	= $prefs->client($client)->get('zmq_port');
-	if ( !$zmq_port ) {  
+	if ( !$zmq_port ) {
 	    # Get global counter, default to base_port
 	    my $next_port = $prefs->get('zmq_next_port');
+	    # Skip ports that are used by another process or already assigned to another player
+	    my $tries = 0;
+	    while ( $tries++ < $MAX_PORT_TRIES && !_zmq_port_available($client, $next_port) ) {
+	        $log->warn("zmq port $next_port is not available, trying next");
+	        $next_port++;
+	    }
 	    # Assign port to this client
 	    $zmq_port   = "tcp://127.0.0.1:" . $next_port;
 	    $prefs->client($client)->set('zmq_port', $zmq_port);
 	    # Increment global counter for next client
 	    $prefs->set('zmq_next_port', $next_port + 1);
-	}	
+	}
 }
 
-sub	_init_LyrionEvents {
-	Slim::Control::Request::subscribe(\&initClient, [['client'],['new','reconnect']]);	
+sub _init_LyrionEvents {
+	Slim::Control::Request::subscribe(\&initClient, [['client'],['new','reconnect']]);
 	Slim::Control::Request::subscribe(\&playlistNewSong, [['playlist'],['newsong']]);
-	Slim::Control::Request::subscribe(\&playlistPause, [['playlist'],['pause']]);	
-	Slim::Control::Request::subscribe(\&playlistStop, [['playlist'],['stop']]);	
-	Slim::Control::Request::subscribe(\&playlistOpen, [['playlist'],['open']]);		
-	$log->debug("  Subscribe to Lyrion events... Done");	
+	Slim::Control::Request::subscribe(\&playlistPause, [['playlist'],['pause']]);
+	Slim::Control::Request::subscribe(\&playlistStop, [['playlist'],['stop','clear']]);
+	Slim::Control::Request::subscribe(\&playlistOpen, [['playlist'],['open']]);
+	$log->debug("  Subscribe to Lyrion events... Done");
 }
 
 sub playlistStop {
 	my $request 	= shift;
 	my $client 		= $request->client() || return;
-	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);	
+	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);
 	$log->debug("playlistStop");
 	Slim::Utils::Timers::killTimers($client, \&poll_ffmpeg_events);
-	$log->debug("Killing timer polling Ffmpeg events on client " . Data::Dump::dump($client->macaddress));	
+	$log->debug("Killing timer polling Ffmpeg events on client " . Data::Dump::dump($client->macaddress));
 	stop_ffmpeg_events($client);
 }
 
 sub playlistPause {
 	my $request 	= shift;
 	my $client 		= $request->client() || return;
-	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);	
-	$log->debug("playlistPause");		
+	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);
+	$log->debug("playlistPause");
 }
 
 sub playlistOpen {
 	my $request 	= shift;
 	my $client 		= $request->client() || return;
-	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);	
-	$log->debug("playlistOpen");			
+	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);
+	$log->debug("playlistOpen");
 }
 
 sub playlistNewSong {
 	my $request = shift;            # Slim::Control::Request object
     # client object (may be undef for global notifications)
 	my $client 		= $request->client() || return;
-	
+
 	my $song 			= $client->playingSong() || return;
-	my $track 		= $song->currentTrack(); 
-	my $url 			= $track->url; 
-	return unless $url =~ /^dvd:\/\//;	
-	
-	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);	
-	$log->debug("playlistNewSong");			
-	Slim::Utils::Timers::setTimer($client, Time::HiRes::time() + 1, \&init_ffmpeg_events, $client);		
+	my $track 		= $song->currentTrack();
+	my $url 			= $track->url;
+	if ( $url !~ /^dvd:\/\// ) {
+		# moved on to a non DVD track: no need to keep polling the previous report
+		stop_ffmpeg_events($client);
+		return;
+	}
+
+	my $mac			= Plugins::PlayDVD::Utils::Misc->mac($client);
+	$log->debug("playlistNewSong");
+	Slim::Utils::Timers::setTimer($client, Time::HiRes::time() + 1, \&init_ffmpeg_events, $client);
 }
 
 # ------------------------------------------------------------------------------
@@ -555,7 +597,7 @@ sub _zmq_send {
 		chomp $zmqBin;
 	}
 	if ( !$zmqBin ) {
-		return (undef, 'zmqsend not found');	
+		return (undef, 'zmqsend not found');
 	}
 
 	local $SIG{PIPE} = 'IGNORE';
@@ -603,26 +645,25 @@ sub currentAudioInfo {
 	my $st  = $ffmpegState{$mac} or return;
 	return unless $st->{ready} && defined $st->{current};
 	my $a = $st->{audio}[ $st->{current} ] or return;
- 
+
 	# "ac3, 48000 Hz, 5.1(side), fltp, 448 kb/s"
 	my @p = map { my $x = $_; $x =~ s/^\s+|\s+$//g; $x } split /,/, ($a->{properties} // '');
-#	my $codec  = uc($p[0] // '');
 	my $codec  = $p[0] // '';
 	my ($hz)   = map { /^(\d+)\s*Hz$/    ? $1 : () } @p;
 	my ($kbps) = map { /^(\d+)\s*kb\/s$/ ? $1 : () } @p;
 	my $layout = $p[2] // '';
 	$layout    =~ s/\(.*\)//;                                  # "5.1(side)" -> "5.1"
 	$layout    = '' if $layout =~ /Hz$|kb\/s$/;
- 
+
 	my $code = $a->{language};
 	my $lang = $code ? ($LANG_NAME{lc $code} // uc $code) : '';
- 
+
 	my $text = join(', ', grep { length }
 		join(' ', grep { length } $codec, $layout),
 		(defined $hz   ? sprintf('%g kHz', $hz / 1000) : ''),
 		(defined $kbps ? "$kbps kb/s"                  : ''),
 	);
- 
+
 	return {
 		index      => $st->{current},
 		count      => scalar @{ $st->{audio} },

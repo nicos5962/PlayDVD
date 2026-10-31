@@ -2,7 +2,7 @@
 
 [[ "$1" = "undefined" ]] && exit
 
-jsonrpc=$(cat /config/prefs/PlayDVD/jsonrpc) 2> /dev/null
+jsonrpc=$(cat "${PLAYDVD_BASEDIR:-/config/prefs/PlayDVD}/jsonrpc" 2> /dev/null)
 [[ -z "$jsonrpc" ]] && exit
 
 [[ "$1" = "-q" ]] && output="/dev/null" && shift || output="-"

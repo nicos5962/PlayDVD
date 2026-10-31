@@ -20,55 +20,53 @@ sub getTag {
 	my ($filter, $md5_size, $md5_offset);
 #$url has "file://" prefix
 
-	$log->debug("Get tags for DVD file url " . Data::Dump::dump($url));		
 	my $tags = {};
 
 	my $file 			= Plugins::PlayDVD::Utils::Misc::pathFromFileURL($url);
 	my $dirname 		= dirname($file);
 	my $basename		= basename($file);
-	
-	$class->_doContentTypeMapping($tags, $basename);				#Content Type	
+
+	$class->_doContentTypeMapping($tags, $basename);				#Content Type
 	my $skipFile		= $class->_doCheckFileSkip($tags, $basename, $dirname);	#Process Only 1 VOB file per forder
 	return if $skipFile;
 
 	$class->_doArtworkMapping($tags, $dirname);						#Search for artwork
 	$class->_doDiscNumMapping($tags, $dirname, $basename);			#Search for disc number
 	$class->_doAlbumArtistMapping($tags, $dirname, $basename);	#Search for album, artist
-	
+
 	$tags->{FILENAME} 	= $file;
-	$tags->{URI}  		= Plugins::PlayDVD::Utils::Misc::fileURLFromPath($tags->{FILENAME});	
-#	$tags->{URI}  		= $url;	
+	$tags->{URI}  		= Plugins::PlayDVD::Utils::Misc::fileURLFromPath($tags->{FILENAME});
+	# Used by the importer to detect changed DVDs (compared with scanned_files)
+	@$tags{qw(FILESIZE TIMESTAMP)} = (stat($file))[7,9];
 
 	my $tracks 		= $class->_doDVDScan($tags, $dirname, $file);
-	$log->debug("DVD tracks " . Data::Dump::dump($tracks));			
 	$tags->{AUDIO} 		= 0;
 	$tags->{CT}    		= "fec";
 	$tags->{CONTENT_TYPE}   = "fec";
-	$log->debug("DVD tags " . Data::Dump::dump($tags));			
-	
+
 ### Need also to save main file as non virtual
 	my $trackid = Slim::Schema->updateOrCreate( {
 		url        	=> $tags->{URI},
 		attributes 	=> $tags,
 		readTags   	=> 0,  # avoid the loop, don't read tags
 		commit	   	=> 1,
-		integrateRemote => 1,                        
+		integrateRemote => 1,
 	} );
 
 	for my $key ( sort { $a <=> $b } keys %$tracks ) {
 		my $track = $tracks->{$key};
 		$track->{VIRTUAL} 	= 1;
 
-		next unless exists $track->{URI};                    
+		next unless exists $track->{URI};
 		my $trackid = Slim::Schema->updateOrCreate( {
 			url        			=> $track->{URI},
 			attributes 			=> $track,
 			readTags   			=> 0,  # avoid the loop, don't read tags
 			commit	   				=> 1,
-			integrateRemote 	=> 1,  	
+			integrateRemote 	=> 1,
 # only "file" and "db" handlers are considered local. All others are considered remote. See my %localHandlers in Slim::Player::ProtocolHandlers
-		} );	
-	}	
+		} );
+	}
 	return $tags;
 }
 
@@ -77,25 +75,24 @@ sub canSeek { 0 }
 
 sub _doContentTypeMapping {
 	my ($class, $tags, $basename) = @_;
-	
+
 	my $extension 		= lc(( split /\./, $basename )[-1]);
 	$tags->{CONTENT_TYPE}	= $Slim::Music::Info::suffixes{$extension};
-}	
+}
 
 sub _doCheckFileSkip {
 	my ($class, $tags, $basename, $dirname) = @_;
 
-	return 0 if $tags->{CONTENT_TYPE} ne 'dvd';	
-	
-	opendir(MYDIR, $dirname);
-	my @files = grep { /.VOB/ } readdir MYDIR;
-	close MYDIR;	
-	sort @files;
+	return 0 if $tags->{CONTENT_TYPE} ne 'dvd';
 
-	if ( @files[0]  eq $basename ) {
+	# Must pick the same file as Importer::_keepFirstVOBPerFolder
+	opendir(my $dh, $dirname) or return 0;
+	my @files = sort grep { /\.vob$/i } readdir $dh;
+	closedir $dh;
+
+	if ( $files[0] eq $basename ) {
 		return 0
-	} else { 
-		$log->debug("	... Skipping file $basename...");	
+	} else {
 		return 1;
 	}
 }
@@ -103,7 +100,7 @@ sub _doCheckFileSkip {
 sub _doArtworkMapping {
 	my ($class, $tags, $dirname) = @_;
 
-	if ( $dirname =~  /VIDEO_TS$/ ) {	
+	if ( $dirname =~  /VIDEO_TS$/ ) {
 		$dirname =~ s/VIDEO_TS$//;
 	}
 	$tags->{COVER} = Slim::Music::Artwork->findStandaloneArtwork(
@@ -117,7 +114,8 @@ sub _doDiscNumMapping {
 	my ($class, $tags, $dirname, $basename) = @_;
 
 	for my $name ($basename, $dirname) {
-		 if ($name =~ /(?:dvd|disc)(\d+)/i) {
+		 next unless defined $name;
+		 if ($name =~ m{\b(?:dvd|disc|disk|cd)[\s._-]*(\d+)\b}i) {
 		     $tags->{'DISC'} = $1;
 		     return;
 		 }
@@ -127,9 +125,9 @@ sub _doDiscNumMapping {
 sub _doAlbumArtistMapping {
 	my ($class, $tags, $dirname, $basename) = @_;
 	# Normalize dirname: ensure it ends with /
-	$dirname =~ s{/?$}{/};	
-	
-	#1. Artist / (YYYY) Album [anything] [r123]/	
+	$dirname =~ s{/?$}{/};
+
+	#1. Artist / (YYYY) Album [anything] [r123]/
 	if (
 		 $dirname =~ m{
 		     .*/([^/]+)/              # Artist
@@ -148,17 +146,17 @@ sub _doAlbumArtistMapping {
 		 return;
 	}
 
-	# 2. Artist / (YYYY-MM-DD) Album [edition]/
+	# 2. Artist / (YYYY-MM-DD | YYYY.MM.DD) Album [edition]?/ [optional subfolders]
 	if (
 		 $dirname =~ m{
-		     .*/([^/]+)/
-		     \((\d{4}-\d{2}-\d{2})\)
-		     \s+(.*?)
-		     \s+\[(.*?)\]/
+		     .*/([^/]+)/                          # Artist
+		     \((\d{4}[-.]\d{2}[-.]\d{2})\)\s+     # (YYYY-MM-DD) or (YYYY.MM.DD)
+		     ([^/]+?)                             # Album
+		     (?:\s+\[[^/]*\])?/                   # optional [edition]
 		 }x
 	) {
 		 my ($artist, $date, $album) = ($1, $2, $3);
-		 $album =~ s/\s*\[.*\]$//;
+		 $date =~ s/\./-/g;                       # normalize dots to dashes
 		 $tags->{'ARTIST'} = $artist;
 		 $tags->{'YEAR'}   = substr($date, 0, 4);
 		 $tags->{'ALBUM'}  = "$date $album";
@@ -261,21 +259,35 @@ sub _doAlbumArtistMapping {
 		 $tags->{'ALBUM'}  = "$date - $album";
 		 return;
 	}
-
-	 $log->debug("		... Parsing forlder KO " . $dirname);
+	# 9. Artist / (YYYY) Album / [optional subfolders, e.g. VIDEO_TS]/
+	if (
+		 $dirname =~ m{
+		     .*/([^/]+)/              # Artist
+		     \((\d{4})\)\s+           # (YYYY)
+		     ([^/]+?)/                # Album
+		     (?:[^/]+/)*$             # optional subdirs (VIDEO_TS, CD1, ...)
+		 }x
+	) {
+		 my ($artist, $year, $album) = ($1, $2, $3);
+		 $album =~ s/\s*\[.*\]$//;    # strip trailing [edition] if any
+		 $tags->{'ARTIST'} = $artist;
+		 $tags->{'YEAR'}   = $year;
+		 $tags->{'ALBUM'}  = $album;
+		 return;
+	}
 }
 
 sub _doDVDScan {
 	my ($class, $tags, $dirname, $file) = @_;
 
-	my $tracks    = {};		
+	my $tracks    = {};
 	my $currtrack;	my $length;	my $bitrate;	my $rate;	my $channels;
 	my $device;
 	if ( $tags->{CONTENT_TYPE} ne 'dvd' ) {
 		$device	= $file;
 	} else {
 		$device	= $dirname;
-		$device =~ s/\/VIDEO_TS$//;		
+		$device =~ s/\/VIDEO_TS$//;
 	}
 	my @tag_names = qw(
 		 CONTENT_TYPE COVER DISC COMMENT ARTIST ALBUM YEAR
@@ -286,7 +298,8 @@ sub _doDVDScan {
 
 	my $cmd = 'mplayer';
 
-	open my $fh, '-|',
+	my $fh;
+	open($fh, '-|',
 		 $cmd,
 		 'dvd://',
 		 '-vo', 'null',
@@ -294,7 +307,10 @@ sub _doDVDScan {
 		 '-identify',
 		 '-frames', '0',
 		 '-dvd-device', $device
-		 or die "Can't run $cmd: $!";
+	) or do {
+		$log->error("Can't run $cmd (is it installed?), no titles found for $device: $!");
+		return $tracks;
+	};
 
 	while (my $line = <$fh>) {
 		 # DVD title information
@@ -337,7 +353,7 @@ sub _doDVDScan {
 	}
 
 	close $fh
-		 or $log->warn("mplayer exited with an error: $?");
+		 or $log->warn("mplayer exited with an error: $? while scanning " . $dirname);
 
 	# Apply audio metadata to all discovered tracks
 	for my $tracknum (keys %$tracks) {

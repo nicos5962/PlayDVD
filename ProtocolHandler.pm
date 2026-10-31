@@ -6,38 +6,38 @@ use warnings;
 use Slim::Utils::Prefs;
 use Slim::Utils::Log;
 use File::Spec::Functions qw(catfile);
-use constant DEFAULT_AUDIO_INFO => 'ac3, 48000 Hz, 192 kb/s'; 
+use constant DEFAULT_AUDIO_INFO => 'ac3, 48000 Hz, 192 kb/s';
 
 my $log   = logger('plugin.playdvd');
 
-sub isRemote { 
-	return 1; 
+sub isRemote {
+	return 1;
 }
 
 sub getMetadataFor {
 	my ( $class, $client, $url ) = @_;
 
-	my $track			= Slim::Schema->rs('Track')->single({ 'url' => $url });	
+	my $track			= Slim::Schema->rs('Track')->single({ 'url' => $url });
 	my $bitrate		= "ac3, 48000 Hz, 192 kb/s";
 	if ($client && $client->playingSong && $client->playingSong->track->url eq $url) {
-		$bitrate =  $class->_getAudioStreamBitrate($client, $url, $track),   
+		$bitrate =  $class->_getAudioStreamBitrate($client, $url, $track),
 	}
-	$client->currentPlaylistUpdateTime( Time::HiRes::time() );			
-	Slim::Control::Request::notifyFromArray($client, ['newmetadata']);			
+	$client->currentPlaylistUpdateTime( Time::HiRes::time() );
+	Slim::Control::Request::notifyFromArray($client, ['newmetadata']);
 	return {
-		bitrate   	=> $bitrate,		
+		bitrate   	=> $bitrate,
 	};
-}	
+}
 
-sub trackInfoURL { 
+sub trackInfoURL {
 	my ( $class, $client, $url ) = @_;
 # This routine is called from package Slim::Menu::TrackInfo, sub menu
 # Protocol Handlers can define their own track info OPML menus
 # This is the page with track info
 # Return so that standard menu is displayed
 	my $tags 		= {};
-	my $track 		= Slim::Schema->rs('Track')->single({ 'url' => $url });		
-	my $items 		= [];	
+	my $track 		= Slim::Schema->rs('Track')->single({ 'url' => $url });
+	my $items 		= [];
 
 	my $itemInfoContributors	= Slim::Menu::TrackInfo::infoContributors( $client, $url, $track );
 	$class->_addItems($itemInfoContributors, $items);
@@ -49,10 +49,10 @@ sub trackInfoURL {
 	$class->_addItems($itemInfoYear, $items);
 
 	my $itemInfoComment	= Slim::Menu::TrackInfo::infoComment( $client, $url, $track );
-	$class->_addItems($itemInfoComment, $items);	
-	
+	$class->_addItems($itemInfoComment, $items);
+
 	my $itemInfoDuration		= Slim::Menu::TrackInfo::infoDuration( $client, $url, $track );
-	$class->_addItems($itemInfoDuration, $items);	
+	$class->_addItems($itemInfoDuration, $items);
 
 	my $iteminfoAudioStreams	= $class->_infoAudioStreams( $client, $url, $track );
 	$class->_addItems($iteminfoAudioStreams, $items);
@@ -70,7 +70,7 @@ sub trackInfoURL {
 		play  => $track->url,
 		cover => '/music/' . ($track->coverid || 0) . '/cover.jpg',
 		menuComplete => 1,
-	};	
+	};
 }
 
 sub _infoLocation {
@@ -79,9 +79,9 @@ sub _infoLocation {
 	my $turl 	= $track->url;
 	$turl		=~ s/\+\+\d+:\d+$//;
 	$turl		=~ s/^dvd:/file:/;
-	
+
 	my $weblink 	= '/music/' . $track->id . '/download';
-	
+
 	my $item = {
 		type  => 'text',
 		name  => Slim::Utils::Unicode::utf8decode_locale( Slim::Utils::Misc::pathFromFileURL($turl) ),
@@ -102,7 +102,7 @@ sub _addItems {
 		if ( scalar keys %{$item} ) {
 			push @{$items}, $item;
 		}
-	} 
+	}
 	else {
 		return;
 	}
@@ -121,19 +121,45 @@ sub _infoAudioStreams {
 	$device 		=~ s/\?title=.*$//;
 	if ($url =~ /\?title=([^&]+)/) {
 		$title = sprintf("%02d", $1);
-	}	
-	my $lsdvdCommand	= `/usr/bin/timeout 45 lsdvd -a "$device"`;	
-	
-	$lsdvdCommand		=~ /(Title: $title.*?)(Title: |$)/s;
-	$streamsLine		= $1;
+	}
+	my $lsdvdOutput		= $class->_lsdvd($device);
+
+	($streamsLine)		= $lsdvdOutput =~ /(Title: $title.*?)(?:Title: |$)/s if defined $title;
+	$streamsLine		//= '';
 
 	$item = {
-		label	=> "PLUGIN_PLAYDVD_AUDIO_STREAMS", 
+		label	=> "PLUGIN_PLAYDVD_AUDIO_STREAMS",
 		name 	=> $streamsLine,
-		type	=> "text", 
+		type	=> "text",
 	};
 
 	return $item;
+}
+
+# lsdvd output per DVD. Called for every track info menu and it can take a while on an
+# ISO, so remember it (the content of a DVD does not change while the server runs).
+my %lsdvdCache;
+
+sub _lsdvd {
+	my ($class, $device) = @_;
+
+	return $lsdvdCache{$device} if defined $lsdvdCache{$device};
+
+	# list form open: no shell, so a quote in the path can not break (or inject into) the command
+	my $output = '';
+	if ( open(my $fh, '-|', '/usr/bin/timeout', 45, 'lsdvd', '-a', $device) ) {
+		local $/;
+		$output = <$fh> // '';
+		close $fh;
+	}
+	else {
+		$log->error("Cannot run lsdvd: $!");
+		return '';
+	}
+
+	# do not cache failures (timeout, lsdvd missing), try again next time
+	$lsdvdCache{$device} = $output if length $output;
+	return $output;
 }
 
 sub formatOverride { 'iso' }
