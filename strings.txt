@@ -1,0 +1,40 @@
+# String file for PlayDVD plugin
+
+PLUGIN_PLAYDVD
+	EN	Play DVD
+
+PLUGIN_PLAYDVD_DESC
+	EN	Play the audio titles of DVDs (VIDEO_TS folders, ISO images and VOB files) from the library, with one track per DVD title and a scanner of its own that finds new, changed and deleted discs
+
+DVD
+	EN	DVD
+
+ISO
+	EN	ISO
+
+VOB
+	EN	VOB
+
+PLUGIN_PLAYDVD_AUDIO_STREAMS
+	EN	Audio streams
+
+PLUGIN_PLAYDVD_IMPORT
+	EN	Import DVD in lyrion
+
+PLUGIN_PLAYDVD_IMPORT_LIBRARY_DELETE_PROGRESS
+	EN	Removing existing DVD tracks from library
+
+PLUGIN_PLAYDVD_IMPORT_LIBRARY_DELETED_PROGRESS
+	EN	Removing deleted DVD files from library
+
+PLUGIN_PLAYDVD_IMPORT_LIBRARY_CHANGED_PROGRESS
+	EN	Rescanning changed DVD files
+
+PLUGIN_PLAYDVD_IMPORT_LIBRARY_NEW_PROGRESS
+	EN	Scanning new DVD files
+
+DVD_NEW_PROGRESS
+	EN	Scanning new DVD files
+
+DISCOVERING_DVD_PROGRESS
+	EN	Searching for DVD files
